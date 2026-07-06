@@ -33,8 +33,8 @@ inline absl::StatusOr<int> RestoreKvexIntoMap(
 
   if (blob.size() < 24 || blob.substr(0, 4) != "KVEX")
     return absl::InvalidArgumentError("KVEX: bad magic/size");
-  size_t p = 4 + 4 + 4 + 4 + 4;               // magic, version, num_entries, batch, flags
-  uint32_t count = u32(20);
+  uint32_t count = u32(20);                    // count field is at offset 20
+  size_t p = 24;  // first entry starts past magic(4)+version+num_entries+batch+flags+count (6*4=24)
   int written = 0;
   for (uint32_t i = 0; i < count; i++) {
     p += 1;                                    // bank (unused: we target one map)
