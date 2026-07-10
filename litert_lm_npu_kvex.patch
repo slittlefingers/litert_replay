@@ -1,0 +1,181 @@
+diff --git a/runtime/executor/BUILD b/runtime/executor/BUILD
+index 37f1e21..042e43c 100644
+--- a/runtime/executor/BUILD
++++ b/runtime/executor/BUILD
+@@ -534,7 +534,10 @@ cc_test(
+ 
+ cc_library(
+     name = "llm_litert_npu_compiled_model_executor",
+-    srcs = ["llm_litert_npu_compiled_model_executor.cc"],
++    srcs = [
++        "kvex_restore.inc",
++        "llm_litert_npu_compiled_model_executor.cc",
++    ],
+     hdrs = ["llm_litert_npu_compiled_model_executor.h"],
+     deps = [
+         ":executor_settings_base",
+diff --git a/runtime/executor/llm_litert_npu_compiled_model_executor.cc b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+index f65aef1..bf4a902 100644
+--- a/runtime/executor/llm_litert_npu_compiled_model_executor.cc
++++ b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+@@ -75,6 +75,8 @@
+ #include "runtime/util/status_macros.h"  // NOLINT
+ #include "runtime/util/tensor_buffer_util.h"
+ 
++#include "runtime/executor/kvex_restore.inc"  // KVEX forensic KV restore
++
+ namespace litert::lm {
+ 
+ namespace {
+@@ -1523,6 +1525,53 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
+ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
+     const ExecutorInputs& inputs, const ExecutorPrefillParams& params) {
+   ran_decode_ = false;
++  // [KVEX] Forensic KV replay: inject the recovered cache HERE, at the top of the
++  // first prefill, AFTER session init (Reset/RestoreContext) has already run and
++  // (previously) wiped a Create-time injection. Setting current_step_ + padding
++  // processed_tokens_ makes this prefill behave like "turn 2": the new prompt tokens
++  // get positions >= step and attend back over the restored KV at positions [0, step).
++  static bool kvex_prefill_restored = false;
++  if (!kvex_prefill_restored && std::getenv("LITERT_RESTORE_KV")) {
++    kvex_prefill_restored = true;
++    int kvex_step = RestoreStepFromEnv();
++    ABSL_LOG(ERROR) << "[KVEX] prefill-hook ENTRY: current_step_=" << current_step_
++                    << " processed_tokens=" << processed_tokens_.TokenCount();
++    // Diagnostic: enumerate the model's actual KV buffers (name + PackedSize) so we
++    // know the true layer count / size classes vs. what session_kv.bin provides.
++    {
++      int kdec = 0, kpre = 0;
++      for (auto& kv : llm_inference_context_.decode_input_buffers) {
++        if (absl::StrContains(kv.first, "kv_cache")) {
++          auto sz = kv.second.PackedSize();
++          ABSL_LOG(ERROR) << "[KVEX] DEC buf '" << kv.first << "' size="
++                          << (sz.HasValue() ? (long)*sz : -1);
++          kdec++;
++        }
++      }
++      for (auto& kv : llm_inference_context_.prefill_input_buffers)
++        if (absl::StrContains(kv.first, "kv_cache")) kpre++;
++      ABSL_LOG(ERROR) << "[KVEX] model KV buffer count: decode=" << kdec
++                      << " prefill=" << kpre
++                      << " (decode_map_total=" << llm_inference_context_.decode_input_buffers.size()
++                      << " prefill_map_total=" << llm_inference_context_.prefill_input_buffers.size() << ")";
++    }
++    auto kn1 = RestoreKvexFromEnv(llm_inference_context_.prefill_input_buffers);
++    auto kn2 = RestoreKvexFromEnv(llm_inference_context_.decode_input_buffers);
++    if (kvex_step > 0) {
++      current_step_ = kvex_step;
++      int have = processed_tokens_.TokenCount();
++      if (have < kvex_step)
++        processed_tokens_.AddProcessedTokens(
++            std::vector<int>(kvex_step - have, 2));
++      else if (have > kvex_step)
++        processed_tokens_.RollBackToStep(kvex_step).IgnoreError();
++    }
++    ABSL_LOG(ERROR) << "[KVEX] prefill-hook RESTORE prefill="
++                    << (kn1.ok() ? *kn1 : -1) << " decode="
++                    << (kn2.ok() ? *kn2 : -1) << " -> current_step_="
++                    << current_step_ << " processed_tokens="
++                    << processed_tokens_.TokenCount();
++  }
+   auto start = absl::Now();
+   LITERT_ASSIGN_OR_RETURN(const auto* text_token_ids,
+                           inputs.GetTextTokenIdsPtr());
+@@ -1553,6 +1602,43 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::Prefill(
+   if (UseEmbeddingLookupManager()) {
+     RETURN_IF_ERROR(embedding_lookup_manager_->CleanupMultiModalEmbeddings());
+   }
++  // [KVEX] Round-trip test: dump the model's OWN post-prefill KV (positions [0,step))
++  // to a KVEX file, so we can reload it via the exact restore path and prove the
++  // injection/layout/step pipeline is sound independent of session_kv.bin's recovered
++  // data. Same container layout the restore expects (magic,ver,4096,1,0,count; then
++  // per tensor: bank(1)+namelen(u16)+name+nbytes(u64)+bytes).
++  if (const char* sp = std::getenv("LITERT_SAVE_KV"); sp && sp[0]) {
++    static bool kvex_saved = false;
++    if (!kvex_saved) {
++      kvex_saved = true;
++      std::ofstream kf(sp, std::ios::binary);
++      auto w16 = [&](uint16_t v) { kf.put((char)(v & 0xff)); kf.put((char)((v >> 8) & 0xff)); };
++      auto w32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) kf.put((char)((v >> (8 * i)) & 0xff)); };
++      auto w64 = [&](uint64_t v) { for (int i = 0; i < 8; i++) kf.put((char)((v >> (8 * i)) & 0xff)); };
++      uint32_t cnt = 0;
++      for (auto& kv : llm_inference_context_.decode_input_buffers)
++        if (absl::StrContains(kv.first, "kv_cache")) cnt++;
++      kf.write("KVEX", 4); w32(1); w32(4096); w32(1); w32(0); w32(cnt);
++      int saved = 0;
++      for (auto& kv : llm_inference_context_.decode_input_buffers) {
++        if (!absl::StrContains(kv.first, "kv_cache")) continue;
++        auto szz = kv.second.PackedSize();
++        if (!szz.HasValue()) continue;
++        size_t nb = *szz;
++        auto lk = ::litert::TensorBufferScopedLock::Create(
++            kv.second, ::litert::TensorBuffer::LockMode::kRead);
++        if (!lk.HasValue()) continue;
++        kf.put((char)1);
++        w16((uint16_t)kv.first.size());
++        kf.write(kv.first.data(), kv.first.size());
++        w64(nb);
++        kf.write((const char*)(*lk).second, nb);
++        saved++;
++      }
++      ABSL_LOG(ERROR) << "[KVEX] SAVE " << saved << " tensors to " << sp
++                      << " at step=" << current_step_;
++    }
++  }
+   auto end = absl::Now();
+   latency_stats_.prefill_e2e_latency_us +=
+       absl::ToInt64Microseconds(end - start);
+@@ -3715,6 +3801,26 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
+       output_type, ple_table_element_type, mul_scale, output_scale,
+       final_zero_point, std::move(kv_quant_params), speculative_decoding_type,
+       std::move(drafter_context), std::move(drafter_aux_context)));
++  // KVEX forensic replay: inject a recovered KV cache + restore step.
++  if (std::getenv("LITERT_RESTORE_KV")) {
++    auto kvex_n1 = RestoreKvexFromEnv(
++        executor->llm_inference_context_.prefill_input_buffers);
++    auto kvex_n2 = RestoreKvexFromEnv(
++        executor->llm_inference_context_.decode_input_buffers);
++    int kvex_step = RestoreStepFromEnv();
++    if (kvex_step > 0) {
++      executor->current_step_ = kvex_step;
++      int have = executor->processed_tokens_.TokenCount();
++      if (have < kvex_step) {
++        executor->processed_tokens_.AddProcessedTokens(
++            std::vector<int>(kvex_step - have, 2));
++      }
++    }
++    ABSL_LOG(ERROR) << "[KVEX] restore prefill="
++                    << (kvex_n1.ok() ? *kvex_n1 : -1)
++                    << " decode=" << (kvex_n2.ok() ? *kvex_n2 : -1)
++                    << " step=" << kvex_step;
++  }
+   return executor;
+ }
+ 
+@@ -3920,6 +4026,26 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelWithoutPerLayerEmbedding(
+       {}, 0, 0, litert::ElementType::None, litert::ElementType::None, 1.0f,
+       1.0f, 0, std::move(kv_quant_params), speculative_decoding_type,
+       std::move(drafter_context), std::move(drafter_aux_context)));
++  // KVEX forensic replay: inject a recovered KV cache + restore step.
++  if (std::getenv("LITERT_RESTORE_KV")) {
++    auto kvex_n1 = RestoreKvexFromEnv(
++        executor->llm_inference_context_.prefill_input_buffers);
++    auto kvex_n2 = RestoreKvexFromEnv(
++        executor->llm_inference_context_.decode_input_buffers);
++    int kvex_step = RestoreStepFromEnv();
++    if (kvex_step > 0) {
++      executor->current_step_ = kvex_step;
++      int have = executor->processed_tokens_.TokenCount();
++      if (have < kvex_step) {
++        executor->processed_tokens_.AddProcessedTokens(
++            std::vector<int>(kvex_step - have, 2));
++      }
++    }
++    ABSL_LOG(ERROR) << "[KVEX] restore prefill="
++                    << (kvex_n1.ok() ? *kvex_n1 : -1)
++                    << " decode=" << (kvex_n2.ok() ? *kvex_n2 : -1)
++                    << " step=" << kvex_step;
++  }
+   return executor;
+ }
+ 

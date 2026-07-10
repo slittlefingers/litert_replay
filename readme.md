@@ -43,3 +43,15 @@ or the answer is garbled (layer-order tuning; no CLI rebuild needed for that).
 KV recovered via: `lemon -S <pid>` (dma-buf sg_table) → reassemble from a LEMON physical dump with the
 correct vmemmap base (`0xfffffffdfe000000`) → classify at step 655 → clean → KVEX. 120 dma-bufs =
 4 banks × 30 tensors, all at step 655.
+
+## Prebuilt binary + source (this fork)
+- **Binary** `litert_lm_advanced_main` (android_arm64, NPU, with the KVEX restore hook) is attached to this repo's **GitHub Release**.
+- **Source of the integration** = `kvex_restore.inc` + `litert_lm_npu_kvex.patch`.
+  Reproduce:
+  ```bash
+  git clone https://github.com/google-ai-edge/LiteRT-LM && cd LiteRT-LM && git checkout b516ae3d
+  cp ../litert_replay/kvex_restore.inc runtime/executor/
+  git apply ../litert_replay/litert_lm_npu_kvex.patch
+  bazel build -c opt --config=android_arm64 //runtime/engine:litert_lm_advanced_main
+  ```
+  Run with `run.sh` (uses `kv_kvsep.bin` = layer-reordered KV, see LAYER_REORDER.md).
